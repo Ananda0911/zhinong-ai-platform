@@ -23,3 +23,10 @@ langgraph==1.2.17
 httpx==0.28.1          # 调 MinerU API（openai SDK 亦依赖）
 python-docx==1.2.0     # docx 直读
 
+# 向量检索（FAISS IndexIDMap2，归一化内积=余弦）
+faiss-cpu==1.15.1
+
+# 限流 + 日志
+slowapi==0.1.10
+loguru==0.7.3
+

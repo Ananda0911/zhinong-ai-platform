@@ -3,8 +3,10 @@ import base64
 import json
 from pathlib import Path
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
+
+from app.rate_limit import limiter
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -43,7 +45,9 @@ def _load_image_as_data_url(image_url: str) -> str | None:
 
 
 @router.post("/chat")
+@limiter.limit("10/minute")
 async def agritech_chat(
+    request: Request,
     body: AgritechChatIn,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),

@@ -3,7 +3,10 @@ import bcrypt
 import jwt
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from slowapi.util import get_remote_address
+
+from app.rate_limit import limiter
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -37,7 +40,8 @@ def create_token(user: User) -> str:
 
 
 @router.post("/register", response_model=UserOut, status_code=201)
-def register(body: RegisterIn, db: Session = Depends(get_db)):
+@limiter.limit("15/minute", key_func=get_remote_address)
+def register(request: Request, body: RegisterIn, db: Session = Depends(get_db)):
     if db.scalar(select(User).where(User.username == body.username)):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "用户名已存在")
     user = User(
@@ -55,7 +59,8 @@ def register(body: RegisterIn, db: Session = Depends(get_db)):
 
 
 @router.post("/login", response_model=TokenOut)
-def login(body: LoginIn, db: Session = Depends(get_db)):
+@limiter.limit("15/minute", key_func=get_remote_address)
+def login(request: Request, body: LoginIn, db: Session = Depends(get_db)):
     user = db.scalar(select(User).where(User.username == body.username))
     if user is None or not _verify_password(body.password, user.password_hash):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "用户名或密码错误")

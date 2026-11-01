@@ -1,13 +1,37 @@
-"""产销智能匹配：品类硬规则过滤 + embedding 余弦相似度 Top-5。"""
+"""产销智能匹配：FAISS 向量检索 + 品类/状态 DB 层过滤。
+
+设计：supply_index / purchase_index 两个进程内 FAISS 索引，
+索引只管"存在性"——品类一致、active、未过期等条件在检索后
+按数据库状态过滤，因此上下架/惰性过期无需同步索引，
+仅发布（add）、编辑（向量重算 → remove+add）、删除（remove）时同步。
+"""
 from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.models import PurchaseInfo, SupplyInfo
-from app.services.embedding import cosine_sim, score_level
+from app.services.embedding import score_level
+from app.services.vector_index import VectorIndex
 
 TOP_K = 5
+CANDIDATES = 60  # FAISS 候选量：覆盖当前量级下全量，再按元数据过滤
+
+supply_index = VectorIndex()
+purchase_index = VectorIndex()
+
+
+def rebuild_market_indexes(db: Session) -> tuple[int, int]:
+    """启动时从 SQLite 全量重建供需索引。返回 (供应条数, 求购条数)。"""
+    sup = db.execute(
+        select(SupplyInfo.id, SupplyInfo.embedding).where(SupplyInfo.embedding.isnot(None))
+    ).all()
+    supply_index.rebuild([(r[0], r[1]) for r in sup])
+    pur = db.execute(
+        select(PurchaseInfo.id, PurchaseInfo.embedding).where(PurchaseInfo.embedding.isnot(None))
+    ).all()
+    purchase_index.rebuild([(r[0], r[1]) for r in pur])
+    return len(sup), len(pur)
 
 
 def effective_status(row) -> str:
@@ -40,30 +64,40 @@ def _match_item(row, score: float, kind: str) -> dict:
 
 
 async def find_matches_for_supply(db: Session, supply: SupplyInfo) -> list[dict]:
-    """为一条供应匹配求购方 Top-5（品类一致 + active + 未过期）。"""
+    """为一条供应匹配求购方 Top-5（FAISS 检索 → 品类/active/未过期过滤）。"""
     if not supply.embedding:
         return []
-    rows = db.scalars(select(PurchaseInfo).where(PurchaseInfo.category == supply.category)).all()
-    scored = []
-    for p in rows:
-        if effective_status(p) != "active":
+    hits = purchase_index.search(supply.embedding, CANDIDATES)
+    if not hits:
+        return []
+    ids = [h[0] for h in hits]
+    rows = {p.id: p for p in db.scalars(select(PurchaseInfo).where(PurchaseInfo.id.in_(ids))).all()}
+    out = []
+    for pid, score in hits:
+        p = rows.get(pid)
+        if p is None or p.category != supply.category or effective_status(p) != "active":
             continue
-        s = cosine_sim(supply.embedding, p.embedding)
-        scored.append(_match_item(p, s, "purchase"))
-    scored.sort(key=lambda x: x["score"], reverse=True)
-    return scored[:TOP_K]
+        out.append(_match_item(p, score, "purchase"))
+        if len(out) >= TOP_K:
+            break
+    return out
 
 
 async def find_matches_for_purchase(db: Session, purchase: PurchaseInfo) -> list[dict]:
-    """为一条求购匹配供应方 Top-5。"""
+    """为一条求购匹配供应方 Top-5（对称逻辑）。"""
     if not purchase.embedding:
         return []
-    rows = db.scalars(select(SupplyInfo).where(SupplyInfo.category == purchase.category)).all()
-    scored = []
-    for s in rows:
-        if effective_status(s) != "active":
+    hits = supply_index.search(purchase.embedding, CANDIDATES)
+    if not hits:
+        return []
+    ids = [h[0] for h in hits]
+    rows = {s.id: s for s in db.scalars(select(SupplyInfo).where(SupplyInfo.id.in_(ids))).all()}
+    out = []
+    for sid, score in hits:
+        s = rows.get(sid)
+        if s is None or s.category != purchase.category or effective_status(s) != "active":
             continue
-        sc = cosine_sim(purchase.embedding, s.embedding)
-        scored.append(_match_item(s, sc, "supply"))
-    scored.sort(key=lambda x: x["score"], reverse=True)
-    return scored[:TOP_K]
+        out.append(_match_item(s, score, "supply"))
+        if len(out) >= TOP_K:
+            break
+    return out

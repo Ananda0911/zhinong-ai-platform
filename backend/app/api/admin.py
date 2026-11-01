@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, UploadFile
+from loguru import logger
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
@@ -27,7 +28,7 @@ from app.models import (
 from app.schemas import AdminContentStatusIn, AdminUserStatusIn
 from app.services.matcher import effective_status
 from app.services.mineru import ALLOWED_EXTS, MAX_FILE_SIZE, MineruError, parse_document
-from app.services.rag import chunk_and_store
+from app.services.rag import chunk_and_store, policy_index
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 
@@ -267,7 +268,7 @@ async def _process_doc(doc_id: int):
             doc.chunk_count = 0
             doc.error_msg = str(e)[:200]  # 前端可见失败原因
             db.commit()
-            print(f"[policy-doc {doc_id}] 解析失败: {e}")
+            logger.warning(f"policy-doc {doc_id} 解析失败: {e}")
 
 
 @router.get("/policy-docs")
@@ -300,8 +301,10 @@ def delete_policy_doc(
     if doc is None:
         raise HTTPException(404, "文档不存在")
     file_path = doc.file_path  # 删除前先取，commit 后对象失效
+    chunk_ids = db.scalars(select(PolicyChunk.id).where(PolicyChunk.doc_id == doc_id)).all()
     db.delete(doc)  # chunks 级联删除
     db.commit()
+    policy_index.remove_many(list(chunk_ids))  # 同步移除 FAISS 索引
     try:
         Path(file_path).unlink(missing_ok=True)
     except OSError:

@@ -1,52 +1,78 @@
-"""政策 RAG：分块入库 + 向量检索（SQLite BLOB + NumPy 余弦 Top-K）。
+"""政策 RAG：分块入库 + FAISS 向量检索。
 
-设计文档 3.4：量级为几十份文档、数千 chunk，全量内存检索 <10ms，
-不接 FAISS/Chroma；量级上来可整体替换为 sqlite-vec / Milvus VectorStore。
+链路：SQLite BLOB 持久化 + FAISS IndexIDMap2(IndexFlatIP) 内存索引。
+- 入库：chunk_and_store 落库后实时 add 进索引
+- 检索：search_chunks 走 FAISS Top-K（归一化内积 = 余弦），
+  命中 id 回 DB 取全文（joinedload 预加载 doc），<0.3 低分丢弃
+- 删除：文档删除时 remove（admin.delete_policy_doc）
+- 启动：rebuild_policy_index 全量重建（main.startup 调用）
 """
-import numpy as np
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
 from app.models import PolicyChunk, PolicyDoc
 from app.services.embedding import embed_text
+from app.services.vector_index import VectorIndex
 
 _splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
 
+# 政策分块索引（进程内共享，uvicorn 单进程）
+policy_index = VectorIndex()
+
+
+def rebuild_policy_index(db: Session) -> int:
+    """从 SQLite 全量重建政策分块索引（只含 ready 文档）。返回索引条数。"""
+    rows = db.execute(
+        select(PolicyChunk.id, PolicyChunk.embedding)
+        .join(PolicyDoc)
+        .where(PolicyDoc.status == "ready", PolicyChunk.embedding.isnot(None))
+    ).all()
+    policy_index.rebuild([(r[0], r[1]) for r in rows])
+    return len(rows)
+
 
 async def chunk_and_store(db: Session, doc_id: int, markdown: str) -> int:
-    """Markdown → 分块 → 逐块向量化入库。返回块数（失败抛异常）。"""
+    """Markdown → 分块 → 逐块向量化入库（落库 + 同步 FAISS）。返回块数。"""
     chunks = _splitter.split_text(markdown)
     if not chunks:
         raise ValueError("文档分块结果为空")
     for idx, text in enumerate(chunks):
         embedding = await embed_text(text)
-        db.add(PolicyChunk(doc_id=doc_id, chunk_index=idx, content=text, embedding=embedding))
+        chunk = PolicyChunk(doc_id=doc_id, chunk_index=idx, content=text, embedding=embedding)
+        db.add(chunk)
+        db.flush()  # 取自增 id 供索引使用
+        policy_index.add(chunk.id, embedding)
     return len(chunks)
 
 
 async def search_chunks(db: Session, query: str, top_k: int = 5) -> list[PolicyChunk]:
-    """问题 → 向量 → 全量余弦 → Top-K（只检索 ready 文档的分块）。
+    """问题 → FAISS Top-K → 按 id 回 DB 取全文。
 
-    joinedload 预加载 doc，避免 session 关闭后访问来源标题触发 lazy load。
+    多取 2 倍候选再按 ready 状态过滤（文档 failed/processing 的分块不入索引，
+    此处过滤为双保险）。joinedload 预加载 doc，避免 session 关闭后 lazy load。
     """
+    if policy_index.size == 0:
+        return []
+    q_vec = await embed_text(query)
+    hits = policy_index.search(q_vec, top_k * 2)  # [(chunk_id, 余弦分)]
+    if not hits:
+        return []
+    ids = [h[0] for h in hits]
     rows = db.scalars(
         select(PolicyChunk)
         .join(PolicyDoc)
         .options(joinedload(PolicyChunk.doc))
-        .where(PolicyDoc.status == "ready")
+        .where(PolicyChunk.id.in_(ids), PolicyDoc.status == "ready")
     ).all()
-    rows = [r for r in rows if r.embedding]
-    if not rows:
-        return []
-
-    q = np.frombuffer(await embed_text(query), dtype=np.float32)
-    mat = np.vstack([np.frombuffer(r.embedding, dtype=np.float32) for r in rows])
-    norms = np.linalg.norm(mat, axis=1) * np.linalg.norm(q)
-    sims = mat @ q / np.where(norms == 0, 1e-9, norms)
-
-    top = np.argsort(-sims)[:top_k]
-    return [rows[i] for i in top if sims[i] > 0.3]  # 相似度过低的直接丢弃
+    by_id = {r.id: r for r in rows}
+    out: list[PolicyChunk] = []
+    for cid, score in hits:
+        if cid in by_id and score > 0.3:  # 相似度过低直接丢弃
+            out.append(by_id[cid])
+        if len(out) >= top_k:
+            break
+    return out
 
 
 def build_context(chunks: list[PolicyChunk]) -> tuple[str, list[str]]:

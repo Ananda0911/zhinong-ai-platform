@@ -17,7 +17,7 @@
         <h2>{{ greeting }}，{{ store.user?.nickname || store.user?.username }}</h2>
         <p>{{ todayStr }} · {{ store.roleLabel }}端 · 今天也要元气满满地助农呀</p>
       </div>
-      <el-button color="#ffffff" round size="large" plain class="hero-btn" @click="onPrimaryAction">
+      <el-button round size="large" plain class="hero-btn" @click="onPrimaryAction">
         {{ primaryAction.label }}
         <el-icon class="el-icon--right"><ArrowRight /></el-icon>
       </el-button>
@@ -209,6 +209,7 @@ function onPrimaryAction() {
   position: relative;
   z-index: 1;
   color: #fff !important;
+  background: transparent !important;
   border-color: rgba(255, 255, 255, 0.5) !important;
   flex-shrink: 0;
 }

@@ -1,8 +1,10 @@
 """政策问答：SSE 流式对话（RAG 检索 Top-5 拼上下文）。"""
 import json
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
+
+from app.rate_limit import limiter
 from langchain_core.messages import AIMessage, HumanMessage
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -22,7 +24,9 @@ def _sse(event: str, data: dict) -> str:
 
 
 @router.post("/chat")
+@limiter.limit("10/minute")
 async def policy_chat(
+    request: Request,
     body: PolicyChatIn,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),

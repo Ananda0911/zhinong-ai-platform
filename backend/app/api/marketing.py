@@ -1,8 +1,10 @@
 """营销工具：文案生成（SSE 流式）+ 生成历史。"""
 import json
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
+
+from app.rate_limit import limiter
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -21,7 +23,9 @@ def _sse(event: str, data: dict) -> str:
 
 
 @router.post("/generate")
+@limiter.limit("10/minute")
 async def generate(
+    request: Request,
     body: MarketingGenerateIn,
     user: User = Depends(require_role("farmer")),
     db: Session = Depends(get_db),

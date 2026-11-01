@@ -2,7 +2,9 @@
 import json
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+
+from app.rate_limit import limiter
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
@@ -14,6 +16,8 @@ from app.services.matcher import (
     effective_status,
     find_matches_for_purchase,
     find_matches_for_supply,
+    purchase_index,
+    supply_index,
 )
 
 router = APIRouter(prefix="/api", tags=["market"])
@@ -151,6 +155,7 @@ async def create_supply(
     db.add(s)
     db.commit()
     db.refresh(s)
+    supply_index.add(s.id, s.embedding)
     return _supply_out(s)
 
 
@@ -195,6 +200,8 @@ async def update_supply(
         setattr(s, k, v)
     s.embedding = await _embed_or_502(_supply_text(body))
     db.commit()
+    supply_index.remove_many([s.id])  # 向量已重算，先移除旧向量
+    supply_index.add(s.id, s.embedding)
     return _supply_out(s)
 
 
@@ -228,6 +235,7 @@ def delete_supply(
         raise HTTPException(404, "供应信息不存在")
     if s.user_id != user.id and user.role != "admin":
         raise HTTPException(403, "只能删除自己发布的信息")
+    supply_index.remove_many([s.id])
     db.delete(s)
     db.commit()
 
@@ -295,6 +303,7 @@ async def create_purchase(
     db.add(p)
     db.commit()
     db.refresh(p)
+    purchase_index.add(p.id, p.embedding)
     return _purchase_out(p)
 
 
@@ -337,6 +346,8 @@ async def update_purchase(
         setattr(p, k, v)
     p.embedding = await _embed_or_502(_purchase_text(body))
     db.commit()
+    purchase_index.remove_many([p.id])  # 向量已重算，先移除旧向量
+    purchase_index.add(p.id, p.embedding)
     return _purchase_out(p)
 
 
@@ -370,6 +381,7 @@ def delete_purchase(
         raise HTTPException(404, "求购信息不存在")
     if p.user_id != user.id and user.role != "admin":
         raise HTTPException(403, "只能删除自己发布的信息")
+    purchase_index.remove_many([p.id])
     db.delete(p)
     db.commit()
 
@@ -378,7 +390,9 @@ def delete_purchase(
 
 
 @router.get("/match/supply/{supply_id}")
+@limiter.limit("10/minute")
 async def match_for_supply(
+    request: Request,
     supply_id: int,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -390,7 +404,9 @@ async def match_for_supply(
 
 
 @router.get("/match/purchase/{purchase_id}")
+@limiter.limit("10/minute")
 async def match_for_purchase(
+    request: Request,
     purchase_id: int,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
