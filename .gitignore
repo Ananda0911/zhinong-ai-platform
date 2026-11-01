@@ -1,0 +1,28 @@
+# Python
+backend/.venv/
+__pycache__/
+*.pyc
+backend/data/*.db
+backend/uploads/*
+!backend/uploads/.gitkeep
+
+# 环境变量（含 API Key，不入库）
+backend/.env
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
+# 本地运行产物与杂项
+.screenshots/
+backend/data/*
+!backend/data/.gitkeep
+backend/logs/
+账号清单.txt
+tools/
+测试报告*.html
